@@ -1,0 +1,38 @@
+# AlphaSeek Custom Lean Container
+# Based on QuantConnect Lean with FastAPI server and custom Parquet data reader
+
+FROM quantconnect/lean:latest
+
+# Install Python FastAPI dependencies
+RUN pip install --no-cache-dir \
+    fastapi==0.115.0 \
+    uvicorn[standard]==0.32.0 \
+    pydantic==2.5.0
+
+# Copy custom data reader
+COPY Common/Data/Custom/ParquetMarketData.cs /Lean/Common/Data/Custom/
+
+# Add Apache.Arrow NuGet package for Parquet reading
+# TODO: Verify compatibility with Lean's .NET version (.NET 6.0 or .NET 8.0)
+# TODO: Test if version 14.0.0 works, otherwise try 13.0.0
+WORKDIR /Lean/Common
+RUN dotnet add QuantConnect.Common.csproj package Apache.Arrow --version 14.0.0
+
+# Build Lean solution with custom data reader
+WORKDIR /Lean
+RUN dotnet build QuantConnect.Lean.sln --configuration Release
+
+# Copy FastAPI server
+COPY server.py /app/server.py
+
+# Create workspace directories
+RUN mkdir -p /app/strategies /app/data/market
+
+# Set working directory
+WORKDIR /app
+
+# Expose FastAPI port
+EXPOSE 8001
+
+# Run FastAPI server
+CMD ["python", "/app/server.py"]
