@@ -181,20 +181,26 @@ namespace QuantConnect.Data.Custom
             // Try TimestampArray first
             if (array is TimestampArray timestampArray)
             {
-                return timestampArray.GetDateTime(index).Value;
+                long? value = timestampArray.GetValue(index);
+                if (!value.HasValue) throw new InvalidOperationException("Timestamp is null");
+                // TimestampArray stores values in milliseconds
+                return DateTimeOffset.FromUnixTimeMilliseconds(value.Value).DateTime;
             }
 
             // Try Int64Array (Unix timestamp in milliseconds)
             if (array is Int64Array int64Array)
             {
-                long unixMs = int64Array.GetValue(index).Value;
-                return DateTimeOffset.FromUnixTimeMilliseconds(unixMs).DateTime;
+                long? unixMs = int64Array.GetValue(index);
+                if (!unixMs.HasValue) throw new InvalidOperationException("Timestamp is null");
+                return DateTimeOffset.FromUnixTimeMilliseconds(unixMs.Value).DateTime;
             }
 
             // Try Date64Array
             if (array is Date64Array date64Array)
             {
-                return date64Array.GetDateTime(index).Value;
+                long? value = date64Array.GetValue(index);
+                if (!value.HasValue) throw new InvalidOperationException("Timestamp is null");
+                return DateTimeOffset.FromUnixTimeMilliseconds(value.Value).DateTime;
             }
 
             throw new InvalidOperationException(
