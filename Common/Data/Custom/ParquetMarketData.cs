@@ -2,9 +2,9 @@
  * ALPHASEEK CUSTOM DATA READER
  * Reads Binance Parquet files for cryptocurrency backtesting
  *
- * Requires Apache.Arrow NuGet package
- * Add to Common/QuantConnect.Common.csproj:
- * <PackageReference Include="Apache.Arrow" Version="14.0.0" />
+ * Requires Parquet.Net NuGet package
+ * Add to Common/QuantConnect.csproj:
+ * <PackageReference Include="Parquet.Net" Version="4.20.0" />
  *
  * Data path: /app/data/market/binance/crypto/binance/{resolution}/{symbol}_YYYYMMDD_YYYYMMDD.parquet
  * Columns: timestamp (index), open, high, low, close, volume (all float64)
@@ -15,9 +15,8 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using Apache.Arrow;
-using Apache.Arrow.Ipc;
-using Apache.Arrow.Types;
+using Parquet;
+using Parquet.Data;
 using QuantConnect.Data.Market;
 
 namespace QuantConnect.Data.Custom
@@ -31,10 +30,18 @@ namespace QuantConnect.Data.Custom
         // Base data path for Parquet files
         private const string DATA_PATH = "/app/data/market/binance/crypto/binance";
 
-        // Cache for storing all bars from the file
-        private static Dictionary<string, List<ParquetMarketData>> _fileCache = new Dictionary<string, List<ParquetMarketData>>();
-        private static int _currentIndex = 0;
-        private static string _currentCacheKey = null;
+        // Instance-level cache for storing all bars from the file
+        private List<ParquetMarketData> _bars = null;
+        private int _currentIndex = 0;
+        private string _cachedFilePath = null;
+
+        /// <summary>
+        /// Constructor for debugging
+        /// </summary>
+        public ParquetMarketData()
+        {
+            Console.WriteLine("[PARQUET] ParquetMarketData() CONSTRUCTOR CALLED");
+        }
 
         /// <summary>
         /// Return the URL source for the subscription
@@ -45,28 +52,44 @@ namespace QuantConnect.Data.Custom
         /// <returns>Subscription data source with file path</returns>
         public override SubscriptionDataSource GetSource(SubscriptionDataConfig config, DateTime date, bool isLiveMode)
         {
+            Console.WriteLine($"[PARQUET] GetSource() - Symbol: {config.Symbol}, Date: {date}");
+
             // Convert resolution to directory name
             string resolution = GetResolutionDirectory(config.Resolution);
 
             // Build directory path
             string directoryPath = Path.Combine(DATA_PATH, resolution);
+            Console.WriteLine($"[PARQUET] Directory path: {directoryPath}");
 
             // Find Parquet file matching symbol pattern
             // Files are named: {SYMBOL}_YYYYMMDD_YYYYMMDD.parquet
             string pattern = $"{config.Symbol.Value}_*.parquet";
+            Console.WriteLine($"[PARQUET] Pattern: {pattern}");
 
             if (Directory.Exists(directoryPath))
             {
+                Console.WriteLine($"[PARQUET] Directory exists");
                 var files = Directory.GetFiles(directoryPath, pattern);
+                Console.WriteLine($"[PARQUET] Found {files.Length} files matching pattern");
                 if (files.Length > 0)
                 {
+                    _cachedFilePath = files[0];  // Cache for later use in Reader
+                    Console.WriteLine($"[PARQUET] Using file: {_cachedFilePath}");
+                    Console.WriteLine($"[PARQUET] File exists: {File.Exists(_cachedFilePath)}");
+                    Console.WriteLine($"[PARQUET] File size: {new FileInfo(_cachedFilePath).Length} bytes");
                     // Use the first matching file (should only be one)
-                    return new SubscriptionDataSource(files[0], SubscriptionTransportMedium.LocalFile);
+                    // Use FileFormat.Csv - TextSubscriptionDataSourceReader will detect StreamReader implementation
+                    return new SubscriptionDataSource(_cachedFilePath, SubscriptionTransportMedium.LocalFile);
                 }
+            }
+            else
+            {
+                Console.WriteLine($"[PARQUET] Directory does NOT exist");
             }
 
             // Fallback to direct path construction
             string filePath = Path.Combine(directoryPath, $"{config.Symbol.Value}.parquet");
+            Console.WriteLine($"[PARQUET] Fallback path: {filePath}");
             return new SubscriptionDataSource(filePath, SubscriptionTransportMedium.LocalFile);
         }
 
@@ -82,33 +105,60 @@ namespace QuantConnect.Data.Custom
         {
             try
             {
-                string cacheKey = $"{config.Symbol}_{config.Resolution}";
+                Console.WriteLine($"[PARQUET] Reader() ENTRY - Symbol: {config.Symbol}, Date: {date}, _bars==null: {_bars == null}");
 
-                // Load entire file into cache on first call
-                if (_currentCacheKey != cacheKey || !_fileCache.ContainsKey(cacheKey))
+                // Load entire file into instance cache on first call
+                if (_bars == null)
                 {
-                    _fileCache[cacheKey] = LoadParquetFile(stream.BaseStream, config);
-                    _currentCacheKey = cacheKey;
+                    Console.WriteLine($"[PARQUET] Loading file for {config.Symbol}");
+                    _bars = LoadParquetFile(stream.BaseStream, config);
                     _currentIndex = 0;
+                    Console.WriteLine($"[PARQUET] Loaded {_bars.Count} bars for {config.Symbol}");
                 }
 
-                // Return next bar from cache
-                var bars = _fileCache[cacheKey];
-                if (_currentIndex < bars.Count)
+                // Return next bar from instance cache
+                if (_currentIndex < _bars.Count)
                 {
-                    var bar = bars[_currentIndex];
+                    var bar = _bars[_currentIndex];
                     _currentIndex++;
+                    Console.WriteLine($"[PARQUET] Returning bar {_currentIndex}/{_bars.Count} - {bar.Time}");
                     return bar;
                 }
 
                 // No more data
+                Console.WriteLine($"[PARQUET] No more data for {config.Symbol}");
                 return null;
             }
             catch (Exception ex)
             {
+                Console.WriteLine($"[PARQUET] ERROR in Reader(): {ex.Message}");
                 throw new InvalidOperationException(
                     $"Failed to read Parquet file for {config.Symbol}: {ex.Message}", ex);
             }
+        }
+
+        /// <summary>
+        /// Get the file path for the Parquet file (uses cached path from GetSource)
+        /// </summary>
+        private string GetFilePath(SubscriptionDataConfig config)
+        {
+            if (_cachedFilePath != null)
+            {
+                return _cachedFilePath;
+            }
+
+            // Fallback: reconstruct the path (should not reach here in normal operation)
+            string resolution = GetResolutionDirectory(config.Resolution);
+            string directoryPath = Path.Combine(DATA_PATH, resolution);
+            string pattern = $"{config.Symbol.Value}_*.parquet";
+
+            var files = Directory.GetFiles(directoryPath, pattern);
+            if (files.Length > 0)
+            {
+                return files[0];
+            }
+
+            throw new FileNotFoundException($"Parquet file not found for {config.Symbol}");
         }
 
         /// <summary>
@@ -116,95 +166,91 @@ namespace QuantConnect.Data.Custom
         /// </summary>
         private List<ParquetMarketData> LoadParquetFile(Stream stream, SubscriptionDataConfig config)
         {
+            Console.WriteLine($"[PARQUET] LoadParquetFile() ENTRY - Symbol: {config.Symbol}");
             var bars = new List<ParquetMarketData>();
 
-            using (var fileReader = new ArrowFileReader(stream))
+            // Get the raw file stream directly (not from StreamReader)
+            Console.WriteLine($"[PARQUET] Getting file stream directly from path...");
+            string filePath = GetFilePath(config);
+            Console.WriteLine($"[PARQUET] Opening file: {filePath}");
+
+            using (var fileStream = File.OpenRead(filePath))
             {
-                // Read schema to understand column structure
-                Schema schema = fileReader.Schema;
+                Console.WriteLine($"[PARQUET] File stream length: {fileStream.Length} bytes");
 
-                // Read all record batches
-                RecordBatch recordBatch;
-                while ((recordBatch = fileReader.ReadNextRecordBatch()) != null)
+                Console.WriteLine($"[PARQUET] Opening Parquet file...");
+                using (var parquetReader = ParquetReader.CreateAsync(fileStream).Result)
                 {
-                    // Get column indices
-                    int timestampIdx = schema.GetFieldIndex("timestamp");
-                    int openIdx = schema.GetFieldIndex("open");
-                    int highIdx = schema.GetFieldIndex("high");
-                    int lowIdx = schema.GetFieldIndex("low");
-                    int closeIdx = schema.GetFieldIndex("close");
-                    int volumeIdx = schema.GetFieldIndex("volume");
+                    Console.WriteLine($"[PARQUET] Parquet file opened - Row groups: {parquetReader.RowGroupCount}");
 
-                    // Get arrays
-                    var timestampArray = recordBatch.Column(timestampIdx);
-                    var openArray = recordBatch.Column(openIdx) as DoubleArray;
-                    var highArray = recordBatch.Column(highIdx) as DoubleArray;
-                    var lowArray = recordBatch.Column(lowIdx) as DoubleArray;
-                    var closeArray = recordBatch.Column(closeIdx) as DoubleArray;
-                    var volumeArray = recordBatch.Column(volumeIdx) as DoubleArray;
-
-                    // Process each row
-                    for (int i = 0; i < recordBatch.Length; i++)
+                    // Read row groups (Parquet.Net 4.x API)
+                    for (int rg = 0; rg < parquetReader.RowGroupCount; rg++)
                     {
-                        // Parse timestamp (could be different types)
-                        DateTime timestamp = ParseTimestamp(timestampArray, i);
-
-                        // Create bar
-                        var bar = new ParquetMarketData
+                        Console.WriteLine($"[PARQUET] Reading row group {rg + 1}/{parquetReader.RowGroupCount}");
+                        using (var rowGroupReader = parquetReader.OpenRowGroupReader(rg))
                         {
-                            Symbol = config.Symbol,
-                            Time = timestamp,
-                            Open = (decimal)openArray.GetValue(i).Value,
-                            High = (decimal)highArray.GetValue(i).Value,
-                            Low = (decimal)lowArray.GetValue(i).Value,
-                            Close = (decimal)closeArray.GetValue(i).Value,
-                            Volume = (decimal)volumeArray.GetValue(i).Value,
-                            Period = config.Resolution.ToTimeSpan()
-                        };
+                            // Get data fields (use var for type inference)
+                            var dataFields = parquetReader.Schema.GetDataFields();
+                            Console.WriteLine($"[PARQUET] Found {dataFields.Length} data fields");
 
-                        bars.Add(bar);
+                            // Find field indices by name (use var for type inference)
+                            var timestampField = dataFields.First(f => f.Name == "timestamp");
+                            var openField = dataFields.First(f => f.Name == "open");
+                            var highField = dataFields.First(f => f.Name == "high");
+                            var lowField = dataFields.First(f => f.Name == "low");
+                            var closeField = dataFields.First(f => f.Name == "close");
+                            var volumeField = dataFields.First(f => f.Name == "volume");
+
+                            // Read columns
+                            DataColumn timestampCol = rowGroupReader.ReadColumnAsync(timestampField).Result;
+                            DataColumn openCol = rowGroupReader.ReadColumnAsync(openField).Result;
+                            DataColumn highCol = rowGroupReader.ReadColumnAsync(highField).Result;
+                            DataColumn lowCol = rowGroupReader.ReadColumnAsync(lowField).Result;
+                            DataColumn closeCol = rowGroupReader.ReadColumnAsync(closeField).Result;
+                            DataColumn volumeCol = rowGroupReader.ReadColumnAsync(volumeField).Result;
+
+                            int rowCount = timestampCol.Data.Length;
+                            Console.WriteLine($"[PARQUET] Row group has {rowCount} rows");
+
+                            // Process each row
+                            for (int i = 0; i < rowCount; i++)
+                            {
+                                if (i % 1000 == 0 && i > 0)
+                                {
+                                    Console.WriteLine($"[PARQUET] Processing row {i}/{rowCount}");
+                                }
+
+                                // Parse timestamp
+                                DateTime timestamp = ((DateTimeOffset)timestampCol.Data.GetValue(i)).UtcDateTime;
+
+                                // Create bar
+                                var bar = new ParquetMarketData
+                                {
+                                    Symbol = config.Symbol,
+                                    Time = timestamp,
+                                    Open = Convert.ToDecimal(openCol.Data.GetValue(i)),
+                                    High = Convert.ToDecimal(highCol.Data.GetValue(i)),
+                                    Low = Convert.ToDecimal(lowCol.Data.GetValue(i)),
+                                    Close = Convert.ToDecimal(closeCol.Data.GetValue(i)),
+                                    Volume = Convert.ToDecimal(volumeCol.Data.GetValue(i)),
+                                    Period = config.Resolution.ToTimeSpan()
+                                };
+
+                                bars.Add(bar);
+                            }
+                            Console.WriteLine($"[PARQUET] Row group processed - Total bars so far: {bars.Count}");
+                        }
                     }
+                    Console.WriteLine($"[PARQUET] All row groups processed - Total bars: {bars.Count}");
                 }
             }
 
             // Sort by timestamp
+            Console.WriteLine($"[PARQUET] Sorting {bars.Count} bars by timestamp...");
             bars = bars.OrderBy(b => b.Time).ToList();
+            Console.WriteLine($"[PARQUET] LoadParquetFile() COMPLETE - Returning {bars.Count} bars");
 
             return bars;
-        }
-
-        /// <summary>
-        /// Parse timestamp from Arrow array (handles multiple timestamp formats)
-        /// </summary>
-        private DateTime ParseTimestamp(IArrowArray array, int index)
-        {
-            // Try TimestampArray first
-            if (array is TimestampArray timestampArray)
-            {
-                long? value = timestampArray.GetValue(index);
-                if (!value.HasValue) throw new InvalidOperationException("Timestamp is null");
-                // TimestampArray stores values in milliseconds
-                return DateTimeOffset.FromUnixTimeMilliseconds(value.Value).DateTime;
-            }
-
-            // Try Int64Array (Unix timestamp in milliseconds)
-            if (array is Int64Array int64Array)
-            {
-                long? unixMs = int64Array.GetValue(index);
-                if (!unixMs.HasValue) throw new InvalidOperationException("Timestamp is null");
-                return DateTimeOffset.FromUnixTimeMilliseconds(unixMs.Value).DateTime;
-            }
-
-            // Try Date64Array
-            if (array is Date64Array date64Array)
-            {
-                long? value = date64Array.GetValue(index);
-                if (!value.HasValue) throw new InvalidOperationException("Timestamp is null");
-                return DateTimeOffset.FromUnixTimeMilliseconds(value.Value).DateTime;
-            }
-
-            throw new InvalidOperationException(
-                $"Unsupported timestamp type: {array.Data.DataType.TypeId}");
         }
 
         /// <summary>

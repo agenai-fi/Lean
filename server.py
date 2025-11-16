@@ -33,7 +33,7 @@ DATA_DIR = Path("/app/data/market")
 
 
 @app.get("/health")
-async def health_check():
+def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
@@ -43,7 +43,7 @@ async def health_check():
 
 
 @app.post("/backtest")
-async def run_backtest(request: BacktestRequest) -> Dict[str, Any]:
+def run_backtest(request: BacktestRequest) -> Dict[str, Any]:
     """
     Execute Lean backtest with provided C# code
 
@@ -59,9 +59,12 @@ async def run_backtest(request: BacktestRequest) -> Dict[str, Any]:
         algo_file = workspace_dir / "Main.cs"
         algo_file.write_text(request.code)
 
+        # Compile C# algorithm to DLL
+        dll_path = compile_algorithm(workspace_dir)
+
         # Create Lean configuration
         config = create_lean_config(
-            workspace_dir=workspace_dir,
+            dll_path=dll_path,
             ticker=request.ticker,
             start_date=request.start_date,
             end_date=request.end_date
@@ -90,23 +93,21 @@ async def run_backtest(request: BacktestRequest) -> Dict[str, Any]:
 
 
 def create_lean_config(
-    workspace_dir: Path,
+    dll_path: Path,
     ticker: str,
     start_date: str,
     end_date: str
 ) -> Dict[str, Any]:
     """
     Create Lean configuration JSON
-
-    TODO: Verify these config keys match actual Lean requirements
     """
     return {
         "environment": "backtesting",
         "algorithm-type-name": "Main",
         "algorithm-language": "CSharp",
-        "algorithm-location": str(workspace_dir / "Main.cs"),
+        "algorithm-location": str(dll_path),
         "data-folder": str(DATA_DIR),
-        "results-destination-folder": str(workspace_dir),
+        "results-destination-folder": str(dll_path.parent),
         "parameters": {
             "ticker": ticker,
             "start-date": start_date,
@@ -144,6 +145,81 @@ def execute_lean(config_file: Path) -> subprocess.CompletedProcess:
     return result
 
 
+def compile_algorithm(workspace_dir: Path) -> Path:
+    """
+    Compile C# algorithm to DLL
+
+    Returns path to compiled DLL
+    """
+    # Create .csproj file
+    csproj_content = create_csproj_file()
+    csproj_file = workspace_dir / "Strategy.csproj"
+    csproj_file.write_text(csproj_content)
+
+    # Run dotnet build
+    cmd = ["dotnet", "build", str(csproj_file), "-c", "Release"]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(workspace_dir),
+            timeout=30
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"C# compilation timed out after 30 seconds. "
+            f"This usually indicates missing assembly references or circular dependencies. "
+            f"Check that ParquetMarketData is properly compiled into QuantConnect.Common.dll"
+        )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"C# compilation failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
+        )
+
+    # Return path to compiled DLL
+    dll_path = workspace_dir / "bin/Release/net9.0/Strategy.dll"
+    if not dll_path.exists():
+        raise FileNotFoundError(
+            f"Expected DLL not found at {dll_path}. Build output:\n{result.stdout}"
+        )
+
+    return dll_path
+
+
+def create_csproj_file() -> str:
+    """
+    Create minimal .csproj file that references Lean assemblies and ParquetSharp
+    """
+    return """<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <AssemblyName>Strategy</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ParquetSharp" Version="18.1.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="QuantConnect.Algorithm">
+      <HintPath>/Lean/Launcher/bin/Release/QuantConnect.Algorithm.dll</HintPath>
+    </Reference>
+    <Reference Include="QuantConnect.Common">
+      <HintPath>/Lean/Launcher/bin/Release/QuantConnect.Common.dll</HintPath>
+    </Reference>
+    <Reference Include="QuantConnect.Indicators">
+      <HintPath>/Lean/Launcher/bin/Release/QuantConnect.Indicators.dll</HintPath>
+    </Reference>
+    <Reference Include="Python.Runtime">
+      <HintPath>/Lean/Launcher/bin/Release/Python.Runtime.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>"""
+
+
 def parse_lean_results(workspace_dir: Path, result: subprocess.CompletedProcess) -> Dict[str, float]:
     """
     Parse Lean backtest results and map to eval_alpha format
@@ -163,14 +239,15 @@ def parse_lean_results(workspace_dir: Path, result: subprocess.CompletedProcess)
         }
     }
     """
-    # Try common result file locations
+    # Lean writes results to bin/Release/net9.0/Main.json
     result_paths = [
+        workspace_dir / "bin/Release/net9.0/Main.json",
+        workspace_dir / "Main.json",
         workspace_dir / "results.json",
-        workspace_dir / "backtests" / "latest" / "results.json",
     ]
 
-    # Scan for any results.json file
-    result_paths.extend(workspace_dir.rglob("results.json"))
+    # Scan for Main.json
+    result_paths.extend(workspace_dir.rglob("Main.json"))
 
     results_file = None
     for path in result_paths:
@@ -180,7 +257,7 @@ def parse_lean_results(workspace_dir: Path, result: subprocess.CompletedProcess)
 
     if not results_file:
         raise FileNotFoundError(
-            f"No results.json found in {workspace_dir}. "
+            f"No Main.json found in {workspace_dir}. "
             f"Check Lean output structure. STDOUT: {result.stdout}"
         )
 
@@ -188,40 +265,20 @@ def parse_lean_results(workspace_dir: Path, result: subprocess.CompletedProcess)
     with open(results_file) as f:
         results = json.load(f)
 
-    # Extract metrics (TODO: verify actual keys)
-    stats = results.get("Statistics", {})
+    # Extract cumulative metrics from totalPerformance
+    total_perf = results.get("totalPerformance", {})
+    portfolio_stats = total_perf.get("portfolioStatistics", {})
+    trade_stats = total_perf.get("tradeStatistics", {})
 
-    # Map Lean metrics to eval_alpha format
-    # TODO: Verify exact key names in Lean Statistics dictionary
+    # Map Lean metrics to eval_alpha format (convert strings to floats)
     return {
-        "annualized_return": parse_percentage(stats.get("Annual Return", "0%")),
-        "sharpe_ratio": parse_float(stats.get("Sharpe Ratio", "0")),
-        "max_drawdown": parse_percentage(stats.get("Max Drawdown", "0%")),
-        "total_trades": parse_int(stats.get("Total Trades", "0")),
-        "win_rate": parse_percentage(stats.get("Win Rate", "0%")),
-        "profit_factor": parse_float(stats.get("Profit Factor", "0"))
+        "annualized_return": float(portfolio_stats.get("compoundingAnnualReturn", 0.0)),
+        "sharpe_ratio": float(portfolio_stats.get("sharpeRatio", 0.0)),
+        "max_drawdown": float(portfolio_stats.get("drawdown", 0.0)),
+        "total_trades": int(trade_stats.get("totalNumberOfTrades", 0)),
+        "win_rate": float(trade_stats.get("winRate", 0.0)),
+        "profit_factor": float(trade_stats.get("profitFactor", 0.0))
     }
-
-
-def parse_percentage(value: str) -> float:
-    """Convert percentage string to decimal (e.g., "80.3%" -> 0.803)"""
-    return float(value.rstrip('%')) / 100.0
-
-
-def parse_float(value: str) -> float:
-    """Parse float from string, handling empty/invalid values"""
-    try:
-        return float(value)
-    except (ValueError, TypeError):
-        return 0.0
-
-
-def parse_int(value: str) -> int:
-    """Parse int from string, handling empty/invalid values"""
-    try:
-        return int(value)
-    except (ValueError, TypeError):
-        return 0
 
 
 if __name__ == "__main__":

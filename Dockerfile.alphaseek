@@ -1,26 +1,38 @@
 # AlphaSeek Custom Lean Container
-# Based on QuantConnect Lean with FastAPI server and custom Parquet data reader
+# Build Lean from source with custom Parquet data reader and Apache.Arrow
 
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+
+# Install git
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+
+# Clone Lean repository (use local files if building from submodule)
+WORKDIR /src
+COPY . /src/Lean
+
+# Parquet.Net is already referenced in QuantConnect.csproj
+# Publish will copy all dependencies including NuGet packages
+
+# Publish Launcher project to /opt/lean (includes all dependencies)
+# Exclude conflicting config files
+WORKDIR /src/Lean
+RUN dotnet publish Launcher/QuantConnect.Lean.Launcher.csproj \
+    --configuration Release \
+    --output /opt/lean \
+    /p:PublishSingleFile=false \
+    /p:ErrorOnDuplicatePublishOutputFiles=false
+
+# Runtime stage - use quantconnect/lean as base for Python dependencies
 FROM quantconnect/lean:latest
 
-# Install Python FastAPI dependencies
+# Copy published Lean binaries from build stage (includes all DLLs)
+COPY --from=build /opt/lean /Lean/Launcher/bin/Release
+
+# Install FastAPI dependencies
 RUN pip install --no-cache-dir \
     fastapi==0.115.0 \
     uvicorn[standard]==0.32.0 \
     pydantic==2.5.0
-
-# Copy custom data reader
-COPY Common/Data/Custom/ParquetMarketData.cs /Lean/Common/Data/Custom/
-
-# Add Apache.Arrow NuGet package for Parquet reading
-# TODO: Verify compatibility with Lean's .NET version (.NET 6.0 or .NET 8.0)
-# TODO: Test if version 14.0.0 works, otherwise try 13.0.0
-WORKDIR /Lean/Common
-RUN dotnet add QuantConnect.Common.csproj package Apache.Arrow --version 14.0.0
-
-# Build Lean solution with custom data reader
-WORKDIR /Lean
-RUN dotnet build QuantConnect.Lean.sln --configuration Release
 
 # Copy FastAPI server
 COPY server.py /app/server.py
@@ -34,5 +46,6 @@ WORKDIR /app
 # Expose FastAPI port
 EXPOSE 8001
 
-# Run FastAPI server
+# Override base image ENTRYPOINT and run FastAPI server
+ENTRYPOINT []
 CMD ["python", "/app/server.py"]

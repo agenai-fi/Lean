@@ -4,3 +4,7 @@ packages/*
 .vs/*
 .nuget/*
 Tests/*
+**/bin/
+**/obj/
+*.user
+*.suo
