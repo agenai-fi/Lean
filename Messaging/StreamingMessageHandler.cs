@@ -34,7 +34,7 @@ namespace QuantConnect.Messaging
     public class StreamingMessageHandler : IMessagingHandler
     {
         private string _port;
-        private PushSocket _server;
+        private PublisherSocket _server;
         private AlgorithmNodePacket _job;
         private OrderEventJsonConverter _orderEventJsonConverter;
 
@@ -52,7 +52,7 @@ namespace QuantConnect.Messaging
         {
             _port = Config.Get("desktop-http-port");
             CheckPort();
-            _server = new PushSocket("@tcp://*:" + _port);
+            _server = new PublisherSocket("@tcp://*:" + _port);
         }
 
         /// <summary>
@@ -98,7 +98,9 @@ namespace QuantConnect.Messaging
 
             var message = new NetMQMessage();
 
-            message.Append(payload);
+            // NetMQ's Append(string) uses Encoding.ASCII, which replaces
+            // non-ASCII chars (e.g. ₮) with '?'. Encode as UTF-8 explicitly.
+            message.Append(System.Text.Encoding.UTF8.GetBytes(payload));
 
             _server.SendMultipartMessage(message);
         }
