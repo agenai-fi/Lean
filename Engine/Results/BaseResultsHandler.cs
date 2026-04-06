@@ -45,7 +45,7 @@ namespace QuantConnect.Lean.Engine.Results
     {
         private RollingWindow<decimal> _previousSalesVolume;
         private DateTime _previousPortfolioTurnoverSample;
-        private bool _packetDroppedWarning;
+        private int _droppedPacketCount;
         private int _logCount;
         private ConcurrentDictionary<string, string> _customSummaryStatistics;
         // used for resetting out/error upon completion
@@ -1157,6 +1157,13 @@ namespace QuantConnect.Lean.Engine.Results
             ProcessAlgorithmLogsImpl(Algorithm.DebugMessages, PacketType.Debug, messageQueueLimit);
             ProcessAlgorithmLogsImpl(Algorithm.ErrorMessages, PacketType.HandledError, messageQueueLimit);
             ProcessAlgorithmLogsImpl(Algorithm.LogMessages, PacketType.Log, messageQueueLimit);
+
+            if (_droppedPacketCount > 0)
+            {
+                Messages.Enqueue(new HandledErrorPacket(AlgorithmId,
+                    FormatMessage($"Algorithm messaging rate limited: {_droppedPacketCount} network packet(s) dropped this cycle (queue > {messageQueueLimit}). Log file unaffected.")));
+                _droppedPacketCount = 0;
+            }
         }
 
         private void ProcessAlgorithmLogsImpl(ConcurrentQueue<string> concurrentQueue, PacketType packetType, int? messageQueueLimit = null)
@@ -1170,6 +1177,9 @@ namespace QuantConnect.Lean.Engine.Results
             var currentMessageCount = -1;
             while (DateTime.UtcNow.Ticks < endTime && concurrentQueue.TryDequeue(out var message))
             {
+                // Always persist to disk regardless of network queue pressure
+                AddToLogStore(message);
+
                 if (messageQueueLimit.HasValue)
                 {
                     if (currentMessageCount == -1)
@@ -1179,13 +1189,9 @@ namespace QuantConnect.Lean.Engine.Results
                     }
                     if (currentMessageCount > messageQueueLimit)
                     {
-                        if (!_packetDroppedWarning)
-                        {
-                            _packetDroppedWarning = true;
-                            // this shouldn't happen in most cases, queue limit is high and consumed often but just in case let's not silently drop packets without a warning
-                            Messages.Enqueue(new HandledErrorPacket(AlgorithmId, FormatMessage("Your algorithm messaging has been rate limited to prevent browser flooding.")));
-                        }
-                        //if too many in the queue already skip the logging and drop the messages
+                        // Count dropped packets; warning is emitted once per cycle in ProcessAlgorithmLogs
+                        _droppedPacketCount++;
+                        //if too many in the queue already skip the network packet and drop the messages
                         continue;
                     }
                 }
@@ -1202,7 +1208,6 @@ namespace QuantConnect.Lean.Engine.Results
                 {
                     Messages.Enqueue(new HandledErrorPacket(AlgorithmId, message));
                 }
-                AddToLogStore(message);
 
                 // increase count after we add
                 currentMessageCount++;
