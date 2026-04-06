@@ -347,8 +347,21 @@ namespace QuantConnect.Lean.Engine.Setup
                     }
                 }
 
-                //Set the starting portfolio value for the strategy to calculate performance:
-                StartingPortfolioValue = algorithm.Portfolio.TotalPortfolioValue;
+                //Set the starting portfolio value for the strategy to calculate performance.
+                // If a persisted starting equity is present (e.g. PersistentPaperBrokerage),
+                // use it so Return% and Sharpe/Sortino are cumulative across restarts.
+                string startingEquityStr;
+                if (liveJob.BrokerageData.TryGetValue("starting-equity", out startingEquityStr) &&
+                    decimal.TryParse(startingEquityStr, NumberStyles.Any, CultureInfo.InvariantCulture, out var persistedStartingEquity) &&
+                    persistedStartingEquity > 0)
+                {
+                    StartingPortfolioValue = persistedStartingEquity;
+                    Log.Trace($"BrokerageSetupHandler.Setup(): Restored starting portfolio value from persisted state: {persistedStartingEquity:F2}");
+                }
+                else
+                {
+                    StartingPortfolioValue = algorithm.Portfolio.TotalPortfolioValue;
+                }
                 StartingDate = DateTime.Now;
             }
             catch (Exception err)
