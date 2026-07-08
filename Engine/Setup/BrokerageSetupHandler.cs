@@ -17,6 +17,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using Newtonsoft.Json.Linq;
 using System.Reflection;
 using Fasterflect;
 using QuantConnect.AlgorithmFactory;
@@ -347,20 +348,25 @@ namespace QuantConnect.Lean.Engine.Setup
                     }
                 }
 
-                //Set the starting portfolio value for the strategy to calculate performance.
-                // If a persisted starting equity is present (e.g. PersistentPaperBrokerage),
-                // use it so Return% and Sharpe/Sortino are cumulative across restarts.
-                string startingEquityStr;
-                if (liveJob.BrokerageData.TryGetValue("starting-equity", out startingEquityStr) &&
-                    decimal.TryParse(startingEquityStr, NumberStyles.Any, CultureInfo.InvariantCulture, out var persistedStartingEquity) &&
-                    persistedStartingEquity > 0)
+                //Set the starting portfolio value (the baseline Return%/Sharpe measure from).
+                // Same mechanism for sim and live: on a RESTART, reload the persisted inception
+                // baseline (the entrypoint injects portfolio.json's startingEquity into config, a
+                // reliable channel) so returns stay continuous since inception. On the FIRST run
+                // there is nothing to reload, so establish inception from the declared seed capital
+                // (live-cash-balance); failing that, the current portfolio value.
+                string reloadedStr = Config.Get("starting-equity");
+                if (!string.IsNullOrWhiteSpace(reloadedStr) &&
+                    decimal.TryParse(reloadedStr, NumberStyles.Any, CultureInfo.InvariantCulture, out var reloaded) &&
+                    reloaded > 0)
                 {
-                    StartingPortfolioValue = persistedStartingEquity;
-                    Log.Trace($"BrokerageSetupHandler.Setup(): Restored starting portfolio value from persisted state: {persistedStartingEquity:F2}");
+                    StartingPortfolioValue = reloaded;
+                    Log.Trace($"BrokerageSetupHandler.Setup(): reloaded persisted starting portfolio value: {reloaded:F2}");
                 }
                 else
                 {
-                    StartingPortfolioValue = algorithm.Portfolio.TotalPortfolioValue;
+                    var seed = GetDeclaredStartingEquity(algorithm);
+                    StartingPortfolioValue = seed > 0 ? seed : algorithm.Portfolio.TotalPortfolioValue;
+                    Log.Trace($"BrokerageSetupHandler.Setup(): starting portfolio value ({(seed > 0 ? "live-cash-balance seed, first run" : "current portfolio")}): {StartingPortfolioValue:F2}");
                 }
                 StartingDate = DateTime.Now;
             }
@@ -377,6 +383,42 @@ namespace QuantConnect.Lean.Engine.Setup
             }
 
             return Errors.Count == 0;
+        }
+
+        /// <summary>
+        /// Declared inception capital = sum of live-cash-balance amounts in the account currency.
+        /// This is the reliable, config-delivered source of truth for the return baseline
+        /// (StartingPortfolioValue); the runtime-injected 'starting-equity' BrokerageData key does
+        /// not survive JobQueue -> Setup. Returns 0 when unavailable/unparseable so the caller can
+        /// fall back to the current portfolio value.
+        /// Note: only account-currency entries are summed; a multi-currency seed would need FX.
+        /// </summary>
+        private static decimal GetDeclaredStartingEquity(IAlgorithm algorithm)
+        {
+            var json = Config.Get("live-cash-balance");
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return 0m;
+            }
+            try
+            {
+                var total = 0m;
+                foreach (var entry in JArray.Parse(json))
+                {
+                    var currency = (string)entry["Currency"];
+                    var amount = entry["Amount"]?.Value<decimal>() ?? 0m;
+                    if (amount > 0m && string.Equals(currency, algorithm.AccountCurrency, StringComparison.OrdinalIgnoreCase))
+                    {
+                        total += amount;
+                    }
+                }
+                return total;
+            }
+            catch (Exception err)
+            {
+                Log.Error($"BrokerageSetupHandler.GetDeclaredStartingEquity(): failed to parse live-cash-balance: {err.Message}");
+                return 0m;
+            }
         }
 
         private bool LoadCashBalance(IBrokerage brokerage, IAlgorithm algorithm)
