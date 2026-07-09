@@ -368,6 +368,14 @@ namespace QuantConnect.Lean.Engine.Setup
                     StartingPortfolioValue = seed > 0 ? seed : algorithm.Portfolio.TotalPortfolioValue;
                     Log.Trace($"BrokerageSetupHandler.Setup(): starting portfolio value ({(seed > 0 ? "live-cash-balance seed, first run" : "current portfolio")}): {StartingPortfolioValue:F2}");
                 }
+                // Publish the resolved inception baseline on the reliable Config channel so the
+                // persistence layer records THIS value on its first write -- not a post-first-fill
+                // Portfolio.TotalPortfolioValue, which would mis-seed the baseline and corrupt
+                // Return%/Sharpe for the strategy's whole life (2026-07 mis-seeding incident).
+                // Write-once authority: first run -> declared seed; restart -> the reloaded frozen
+                // inception (same value the brokerage already set here, so this is idempotent).
+                Config.Set("starting-equity", StartingPortfolioValue.ToString(CultureInfo.InvariantCulture));
+                Log.Trace($"BrokerageSetupHandler.Setup(): published inception baseline to config: {StartingPortfolioValue:F2}");
                 StartingDate = DateTime.Now;
             }
             catch (Exception err)
